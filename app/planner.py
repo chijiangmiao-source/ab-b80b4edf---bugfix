@@ -26,9 +26,10 @@ target's membership across all plans tied on criteria 1+2:
 ``required`` / ``optional`` / ``excluded``.
 
 Algorithm: subset DP over ``(mask, last)`` storing the earliest achievable
-end time; a reverse reachability closure over optimal masks collects every
-state lying on an optimal plan; the canonical sequence is recovered by
-greedy smallest-id extension inside that closure.  Pure standard library.
+end time; a backward DP gives, for each state, the latest end time from
+which an optimal completion still exists; the canonical sequence is
+recovered by greedy smallest-id extension within those thresholds.
+Pure standard library.
 """
 
 from __future__ import annotations
@@ -305,52 +306,81 @@ def plan(raw_request: dict) -> dict:
         elif v == best_value and e == best_end:
             optimal_masks.add(mask)
 
-    # Reverse closure: good[mask,last] lies on at least one ordering that
-    # starts at a seed, realizes the dp earliest times, and ends (at an
-    # optimal mask) at best_end.
-    good = bytearray(size * m)
-    stack = []
-    for om in optimal_masks:
-        if om == 0:
-            continue
-        base = om * m
-        x = om
-        while x:
-            b = x & -x
-            x ^= b
+    # Backward "latest still-optimal end" thresholds:
+    # thr[mask * m + last] is the largest exposure end time at state
+    # (mask, last) from which some continuation reaches an optimal mask at
+    # exactly best_end.  Earliest feasible start is monotone non-decreasing
+    # in the slew-ready time, so extendability is monotone in the current
+    # end: a schedule ending at e can be completed optimally iff
+    # e <= thr[state].  This replaces a reverse closure that only stitched
+    # edges at dp-earliest end times -- an optimal plan may visit a state
+    # later than its earliest end (a different ordering realizes the early
+    # one), which wrongly hid lexicographically smaller optimal sequences.
+    NEG = -(1 << 62)
+    thr = [NEG] * (size * m)
+    _wins_b, _dur_b, _sm_b = wins, dur, sm
+    # Memoize the inverted earliest-start bound per (next target, threshold,
+    # slew): few distinct (T, slew) pairs recur across all predecessor masks.
+    emax_cache = [dict() for _ in range(m)]
+    for mask in range(full, 0, -1):
+        base = mask * m
+        remaining = full ^ mask
+        is_terminal = mask in optimal_masks
+        # Successor targets (independent of `last`) whose state still admits
+        # an optimal completion; everything else skips the window math.
+        fwd = 0
+        if remaining and not is_terminal:
+            x = remaining
+            while x:
+                cb = x & -x
+                x ^= cb
+                nxt = lsb_index[cb]
+                if thr[base + offset_k[nxt]] != NEG:
+                    fwd |= cb
+        members = mask
+        while members:
+            b = members & -members
+            members ^= b
             last = lsb_index[b]
-            if dp[base + last] == best_end:
-                p = base + last
-                if not good[p]:
-                    good[p] = 1
-                    stack.append((om, last))
-
-    while stack:
-        mask, last = stack.pop()
-        prev_mask = mask ^ (1 << last)
-        if prev_mask == 0:
-            continue
-        cur_end = dp[mask * m + last]
-        base = prev_mask * m
-        x = prev_mask
-        while x:
-            b = x & -x
-            x ^= b
-            prev = lsb_index[b]
-            prev_end = dp[base + prev]
-            if prev_end == UNREACH:
+            if dp[base + last] == UNREACH:
                 continue
-            ready = prev_end + sm[prev][last]
-            st = -1
-            for lo, hi in wins[last]:
-                t = ready if ready > lo else lo
-                if t + dur[last] <= hi and (st < 0 or t < st):
-                    st = t
-            if st >= 0 and st + dur[last] == cur_end:
-                p = base + prev
-                if not good[p]:
-                    good[p] = 1
-                    stack.append((prev_mask, prev))
+            # Stop here (only optimal masks may end an optimal plan).  No
+            # extension can raise the bar: an appended positive-length
+            # exposure always ends strictly after the current end.
+            if is_terminal:
+                thr[base + last] = best_end
+                continue
+            best = NEG
+            if fwd:
+                row = _sm_b[last]
+                cand = fwd
+                while cand:
+                    cb = cand & -cand
+                    cand ^= cb
+                    nxt = lsb_index[cb]
+                    T = thr[base + offset_k[nxt]]  # thr[mask | cb, nxt]
+                    sl = row[nxt]
+                    e_max = emax_cache[nxt].get((T, sl))
+                    if e_max is None:
+                        # Appending nxt at current end e: ready = e + slew,
+                        # earliest next end = earliest_start(ready) + dur.
+                        # Invert the earliest-start map: the largest ready r
+                        # for which some window yields an end <= T is
+                        # min(close, T) - dur; hence e_max = r - slew.
+                        e_max = NEG
+                        cap = T - _dur_b[nxt]
+                        for lo, hi in _wins_b[nxt]:
+                            bound = hi - _dur_b[nxt]
+                            if bound > cap:
+                                bound = cap
+                            if lo <= bound:
+                                r = bound - sl
+                                if r > e_max:
+                                    e_max = r
+                        emax_cache[nxt][(T, sl)] = e_max
+                    if e_max > best:
+                        best = e_max
+            thr[base + last] = best
 
     # Membership of every target across all criteria-1+2 optimal plans.
     ever_in = 0
@@ -360,7 +390,7 @@ def plan(raw_request: dict) -> dict:
         ever_out |= full ^ om
 
     canonical_steps, canonical_ids = _canonical(
-        m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks
+        m, ids, alive, dur, wins, s0, sm, thr, optimal_masks, best_end
     )
 
     classifications = []
@@ -397,12 +427,16 @@ def plan(raw_request: dict) -> dict:
     }
 
 
-def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
+def _canonical(
+    m, ids, alive, dur, wins, s0, sm, thr, optimal_masks, best_end
+):
     """Greedy reconstruction of the lexicographically smallest optimal plan.
 
-    At each position take the smallest id whose next state is in the reverse
-    closure; the earliest-start timeline is then forced (dp times), so each
-    sequence has exactly one reported schedule.
+    At each position take the smallest id whose earliest feasible append
+    leaves an end time no later than the backward threshold of the new state
+    (i.e. an optimal completion still exists).  The earliest-start timeline
+    is then forced at every step, so each sequence has exactly one reported
+    schedule.
     """
     # Compressed indices ordered by user-facing target id.
     order = sorted(range(m), key=lambda k: ids[alive[k]])
@@ -430,19 +464,19 @@ def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
             bit = 1 << k
             if mask & bit:
                 continue
-            new_mask = mask | bit
-            end = dp[new_mask * m + k]
-            if end == UNREACH or not good[new_mask * m + k]:
-                continue
             ready = s0[k] if last == -1 else prev_end + sm[last][k]
             st, _ = earliest_with_window(k, ready)
-            if st is None or st + dur[k] != end:
+            if st is None:
                 continue
-            chosen = k
-            chosen_ready = ready
-            chosen_start = st
-            chosen_end = end
-            break
+            end = st + dur[k]
+            # An optimal completion from the resulting state exists iff its
+            # end is within that state's latest-still-optimal threshold.
+            if end <= thr[(mask | bit) * m + k]:
+                chosen = k
+                chosen_ready = ready
+                chosen_start = st
+                chosen_end = end
+                break
         if chosen == -1:
             break
 
@@ -466,8 +500,8 @@ def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
         last = chosen
         prev_end = chosen_end
 
-    if optimal_masks and mask not in optimal_masks:
-        # Defensive: should be impossible by construction of the closure.
+    if not optimal_masks or mask not in optimal_masks or prev_end != best_end:
+        # Defensive: should be impossible by construction of the thresholds.
         raise RuntimeError("internal: reconstructed plan is not optimal")
 
     return steps, out_ids

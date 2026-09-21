@@ -27,3 +27,19 @@ services:
       - .:/workspace:ro
     command: ["python", "-m", "unittest", "discover", "-s", "tests"]
     profiles: ["verify"]
+
+  # Incident replay through the public HTTP API. Starts only after the
+  # service is healthy; talks to it over the Compose network.
+  acceptance:
+    build: .
+    image: night-planner:latest
+    working_dir: /workspace
+    volumes:
+      - .:/workspace:ro
+    environment:
+      BASE_URL: http://night-planner:8080
+    command: ["python", "tests/acceptance_replay.py"]
+    depends_on:
+      night-planner:
+        condition: service_healthy
+    profiles: ["acceptance"]

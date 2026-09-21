@@ -2,6 +2,7 @@
 
 import itertools
 import random
+import time
 import unittest
 
 from app.planner import PlanError, Window, plan
@@ -297,6 +298,49 @@ class TestPlanner(unittest.TestCase):
         self.assertEqual(res["canonical_plan"]["target_ids"], [-5, 0, 10])
         self.assertMatchesBrute(raw)
 
+    def test_reported_lex_tie_late_state_visit(self):
+        # Regression: four targets where the lexicographically smallest
+        # optimal sequence [3,4,1,2] visits state ({1,3,4}, target 1) at
+        # end 7 although that state's earliest achievable end is 6 (via
+        # ordering [4,3,1]).  A reverse closure that only stitches edges at
+        # dp-earliest ends dropped this plan and returned [4,3,1,2].
+        raw = {
+            "targets": [
+                {"id": 1, "duration": 1, "value": 1,
+                 "windows": [{"open": 5, "close": 12}]},
+                {"id": 2, "duration": 1, "value": 1,
+                 "windows": [{"open": 7, "close": 9}]},
+                {"id": 3, "duration": 1, "value": 1,
+                 "windows": [{"open": 2, "close": 7}]},
+                {"id": 4, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 8}]},
+            ],
+            "slew": {
+                "from_night_start": [3, 0, 1, 1],
+                "between_targets": [
+                    [0, 0, 6, 6],
+                    [3, 2, 0, 2],
+                    [1, 4, 6, 2],
+                    [0, 6, 0, 3],
+                ],
+            },
+        }
+        res = plan(raw)
+        self.assertEqual(res["objective"],
+                         {"total_value": 4, "final_end_time": 8})
+        self.assertEqual(res["canonical_plan"]["target_ids"], [3, 4, 1, 2])
+        self.assertEqual(
+            [(s["id"], s["start_time"], s["end_time"])
+             for s in res["canonical_plan"]["steps"]],
+            [(3, 2, 3), (4, 5, 6), (1, 6, 7), (2, 7, 8)],
+        )
+        self.assertEqual(res["optimal_target_set_count"], 1)
+        self.assertFalse(res["empty_plan"])
+        statuses = {c["id"]: c["status"] for c in res["classifications"]}
+        self.assertEqual(statuses, {1: "required", 2: "required",
+                                    3: "required", 4: "required"})
+        self.assertMatchesBrute(raw)
+
     def test_step_evidence_fields(self):
         raw = make_raw(
             n=2,
@@ -321,8 +365,13 @@ class TestPlanner(unittest.TestCase):
         self.assertEqual((s2["start_time"], s2["end_time"]), (8, 11))
 
     def test_fuzz_against_brute_force(self):
+        # Two regimes: loose (wide windows, short slews) and tight (narrow
+        # windows and sizable slews), where an optimal ordering often visits
+        # a state later than that state's dp-earliest end -- the situation the
+        # old reverse closure mishandled.
         rng = random.Random(20260919)
-        for case in range(120):
+
+        def gen_case(regime):
             n = rng.randint(2, 7)
             ids = rng.sample(range(-20, 80), n)
             d = [rng.randint(1, 6) for _ in range(n)]
@@ -332,14 +381,140 @@ class TestPlanner(unittest.TestCase):
                 k = rng.randint(0, 3)
                 ws = []
                 for _ in range(k):
-                    lo = rng.randint(0, 12)
-                    hi = lo + rng.randint(0, 8)
+                    if regime == "tight":
+                        lo = rng.randint(0, 10)
+                        hi = lo + rng.randint(0, 5)
+                    else:
+                        lo = rng.randint(0, 12)
+                        hi = lo + rng.randint(0, 8)
                     ws.append((lo, hi))
                 w.append(ws)
-            s0 = [rng.randint(0, 8) for _ in range(n)]
-            sm = [[rng.randint(0, 6) for _ in range(n)] for _ in range(n)]
-            raw = make_raw(n, d, v, w, s0, sm, ids=ids)
-            self.assertMatchesBrute(raw)
+            if regime == "tight":
+                s0 = [rng.randint(0, 9) for _ in range(n)]
+                sm = [[rng.randint(0, 8) for _ in range(n)] for _ in range(n)]
+            else:
+                s0 = [rng.randint(0, 8) for _ in range(n)]
+                sm = [[rng.randint(0, 6) for _ in range(n)] for _ in range(n)]
+            return make_raw(n, d, v, w, s0, sm, ids=ids)
+
+        for case in range(120):
+            self.assertMatchesBrute(gen_case("loose"))
+        for case in range(160):
+            self.assertMatchesBrute(gen_case("tight"))
+
+    # ------------------------------------------------------------- boundary
+
+    def _assert_steps_consistent(self, res, raw):
+        """Independently re-check every reported step and the objective."""
+        d = {t["id"]: t["duration"] for t in raw["targets"]}
+        idx = {t["id"]: i for i, t in enumerate(raw["targets"])}
+        s0 = raw["slew"]["from_night_start"]
+        sm = raw["slew"]["between_targets"]
+        steps = res["canonical_plan"]["steps"]
+        prev_end = 0
+        prev_id = None
+        total = 0
+        for pos, s in enumerate(steps):
+            tid = s["id"]
+            i = idx[tid]
+            slew_secs = s0[i] if prev_id is None else sm[idx[prev_id]][i]
+            self.assertEqual(s["slew"]["seconds"], slew_secs)
+            self.assertEqual(s["slew"]["finish_time"], prev_end + slew_secs)
+            self.assertGreaterEqual(s["start_time"], s["slew"]["finish_time"])
+            self.assertEqual(s["end_time"], s["start_time"] + s["exposure_seconds"])
+            self.assertEqual(s["exposure_seconds"], d[tid])
+            fits = any(
+                w["open"] <= s["start_time"] and s["end_time"] <= w["close"]
+                for w in raw["targets"][i]["windows"]
+            )
+            self.assertTrue(fits, s)
+            self.assertEqual(s["order"], pos + 1)
+            prev_end = s["end_time"]
+            prev_id = tid
+            total += next(t["value"] for t in raw["targets"] if t["id"] == tid)
+        self.assertEqual(
+            [s["id"] for s in steps], res["canonical_plan"]["target_ids"]
+        )
+        self.assertEqual(res["objective"]["total_value"], total)
+        end = prev_end if steps else 0
+        self.assertEqual(res["objective"]["final_end_time"], end)
+        self.assertEqual(res["empty_plan"], not steps)
+
+    def test_boundary_all_18_targets_scheduled(self):
+        # Every target trivially visible with zero slews: the unique optimum
+        # observes all 18; canonical order is the id-sorted one.  Also guards
+        # against any regression toward permutation enumeration.
+        ids = [7, -3, 0, 100, 2, 9, 50, 1, 8, 4,
+               11, 12, 13, 14, -9, 6, 3, 5]
+        raw = make_raw(
+            n=18,
+            d=[1] * 18,
+            v=[1] * 18,
+            w=[[(0, 100)] for _ in range(18)],
+            s0=[0] * 18,
+            sm=[[0] * 18 for _ in range(18)],
+            ids=ids,
+        )
+        t0 = time.time()
+        res = plan(raw)
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 15.0, "n=18 must stay subset-DP fast")
+        self.assertEqual(res["objective"],
+                         {"total_value": 18, "final_end_time": 18})
+        self.assertEqual(res["canonical_plan"]["target_ids"], sorted(ids))
+        self.assertEqual(res["optimal_target_set_count"], 1)
+        self.assertTrue(all(c["status"] == "required"
+                            for c in res["classifications"]))
+        self._assert_steps_consistent(res, raw)
+
+    def test_boundary_18_targets_three_windows_each(self):
+        # Dense random instance at the size limit with up to three windows;
+        # correctness is covered by the small-n brute-force fuzz, so here we
+        # assert internal consistency, classifications sanity and speed.
+        rng = random.Random(424242)
+        n = 18
+        ids = rng.sample(range(-100, 100), n)
+        d = [rng.randint(1, 5) for _ in range(n)]
+        v = [rng.randint(1, 9) for _ in range(n)]
+        w = []
+        for _ in range(n):
+            ws = []
+            for _ in range(3):
+                lo = rng.randint(0, 40)
+                ws.append((lo, lo + rng.randint(0, 20)))
+            w.append(ws)
+        s0 = [rng.randint(0, 10) for _ in range(n)]
+        sm = [[rng.randint(0, 8) for _ in range(n)] for _ in range(n)]
+        raw = make_raw(n, d, v, w, s0, sm, ids=ids)
+        t0 = time.time()
+        res = plan(raw)
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 15.0, "n=18 must stay subset-DP fast")
+        self._assert_steps_consistent(res, raw)
+        # A target appearing in the canonical plan cannot be excluded; an
+        # excluded target cannot appear.
+        in_plan = set(res["canonical_plan"]["target_ids"])
+        for c in res["classifications"]:
+            self.assertIn(c["status"], {"required", "optional", "excluded"})
+            self.assertEqual(c["id"] in in_plan, c["status"] != "excluded")
+        self.assertEqual(res["target_count"], 18)
+
+    def test_boundary_18_none_observable(self):
+        # Size limit with no target ever visible: empty-plan zero conclusion.
+        raw = make_raw(
+            n=18,
+            d=[5] * 18,
+            v=[1] * 18,
+            w=[[] for _ in range(18)],
+            s0=[0] * 18,
+            sm=[[0] * 18 for _ in range(18)],
+        )
+        res = plan(raw)
+        self.assertEqual(res["objective"], {"total_value": 0, "final_end_time": 0})
+        self.assertTrue(res["empty_plan"])
+        self.assertEqual(res["canonical_plan"]["target_ids"], [])
+        self.assertTrue(all(c["status"] == "excluded"
+                            for c in res["classifications"]))
 
     # ------------------------------------------------------------- invalid
 

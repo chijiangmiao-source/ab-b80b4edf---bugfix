@@ -51,6 +51,18 @@ Run the tests (incl. a brute-force cross-check on randomized small cases):
 python -m unittest discover -s tests
 ```
 
+Clean-environment acceptance gate (tears down the stack, rebuilds the image,
+waits for health, replays the canonical-plan incident through `POST /plan`,
+then runs the unit suite including the brute-force cross-check and the
+n = 18 boundary tests):
+
+```bash
+./acceptance.sh
+```
+
+The replay itself is `tests/acceptance_replay.py` and can target any running
+service, e.g. `BASE_URL=http://localhost:8080 python tests/acceptance_replay.py`.
+
 ## API
 
 ### `POST /plan`
@@ -169,9 +181,14 @@ returned. Malformed JSON yields `{"error": "invalid_json"}`.
    slew after the previous end, then earliest legal start in any window.
 3. Scan all reachable masks to select those maximizing value and, among
    them, minimizing end time.
-4. Reverse reachability from the optimal masks marks every DP state that
-   lies on at least one optimal plan; membership across those states gives
-   required / optional / excluded.
-5. Greedy smallest-id walk through the marked states reconstructs the
+4. A backward DP assigns each state the *latest* end time from which an
+   optimal completion (ending at an optimal mask at the criterion-2 end)
+   still exists; earliest feasible start is monotone in the arrival time,
+   so extendability is a single threshold comparison. Membership across
+   the optimal masks gives required / optional / excluded.
+5. Greedy smallest-id walk against those thresholds reconstructs the
    unique lexicographically smallest plan, with a fully determined timeline
-   (earliest legal start at every step).
+   (earliest legal start at every step). The thresholds also cover optimal
+   plans that visit a state later than that state's earliest achievable end
+   — those plans are real but were invisible to a dp-earliest-only reverse
+   closure.
