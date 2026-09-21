@@ -169,9 +169,14 @@ returned. Malformed JSON yields `{"error": "invalid_json"}`.
    slew after the previous end, then earliest legal start in any window.
 3. Scan all reachable masks to select those maximizing value and, among
    them, minimizing end time.
-4. Reverse reachability from the optimal masks marks every DP state that
-   lies on at least one optimal plan; membership across those states gives
-   required / optional / excluded.
-5. Greedy smallest-id walk through the marked states reconstructs the
-   unique lexicographically smallest plan, with a fully determined timeline
-   (earliest legal start at every step).
+4. Membership of those optimal masks directly gives each target's
+   required / optional / excluded classification.
+5. A backward subset DP computes, for every state, the latest exposure end
+   from which an optimal set is still completable by the minimal end time;
+   a greedy smallest-id walk respecting those deadlines reconstructs the
+   lexicographically smallest plan, with a fully determined timeline
+   (earliest legal start at every step). The deadlines are essential: an
+   optimal plan may pass through an intermediate state *later* than that
+   state's earliest achievable end, when waiting changes nothing
+   downstream — a forward-only reachability closure would miss the
+   lexicographically smallest such plan.

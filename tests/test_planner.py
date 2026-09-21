@@ -297,6 +297,88 @@ class TestPlanner(unittest.TestCase):
         self.assertEqual(res["canonical_plan"]["target_ids"], [-5, 0, 10])
         self.assertMatchesBrute(raw)
 
+    def test_four_target_lex_tie_with_idle_prefix(self):
+        # Regression: plans [4,3,1,2] and [3,4,1,2] share value 4 and final
+        # end 8, but the latter passes through the triple state *later* than
+        # its earliest achievable end (the idle wait is absorbed downstream).
+        # A forward-only earliest-end closure used to miss it and returned
+        # the lexicographically larger sequence.
+        raw = make_raw(
+            n=4,
+            d=[1, 1, 1, 1],
+            v=[1, 1, 1, 1],
+            w=[[(5, 12)], [(7, 9)], [(2, 7)], [(0, 8)]],
+            s0=[3, 0, 1, 1],
+            sm=[[0, 0, 6, 6], [3, 2, 0, 2], [1, 4, 6, 2], [0, 6, 0, 3]],
+        )
+        res = plan(raw)
+        self.assertEqual(res["objective"],
+                         {"total_value": 4, "final_end_time": 8})
+        self.assertEqual(res["canonical_plan"]["target_ids"], [3, 4, 1, 2])
+        intervals = [(s["start_time"], s["end_time"])
+                     for s in res["canonical_plan"]["steps"]]
+        self.assertEqual(intervals, [(2, 3), (5, 6), (6, 7), (7, 8)])
+        statuses = {c["id"]: c["status"] for c in res["classifications"]}
+        self.assertEqual(statuses, {1: "required", 2: "required",
+                                    3: "required", 4: "required"})
+        self.assertEqual(res["optimal_target_set_count"], 1)
+        self.assertMatchesBrute(raw)
+
+    def test_boundary_eighteen_targets(self):
+        # Upper size bound: subset DP must stay polynomial-ish in the set
+        # count (no permutation enumeration).  Everything trivially fits.
+        raw = make_raw(
+            n=18,
+            d=[1] * 18,
+            v=[1] * 18,
+            w=[[(0, 50)] for _ in range(18)],
+            s0=[0] * 18,
+            sm=[[0] * 18 for _ in range(18)],
+            ids=list(range(18, 0, -1)),
+        )
+        res = plan(raw)
+        self.assertEqual(res["objective"],
+                         {"total_value": 18, "final_end_time": 18})
+        self.assertEqual(res["canonical_plan"]["target_ids"],
+                         list(range(1, 19)))
+        self.assertTrue(
+            all(c["status"] == "required" for c in res["classifications"])
+        )
+
+    def test_boundary_eighteen_targets_constrained(self):
+        # Random-looking constrained boundary case: must finish fast and the
+        # reported timeline must independently satisfy every legality rule.
+        ids = list(range(1, 19))
+        d = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3]
+        v = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3]
+        w = [[(0, 30)], [(2, 32)], [(4, 34)], [(0, 30)], [(6, 36)],
+             [(0, 40)], [(1, 31)], [(8, 38)], [(2, 32)], [(0, 30)],
+             [(4, 34)], [(10, 42)], [(0, 45)], [(6, 36)], [(2, 40)],
+             [(0, 30)], [(1, 31)], [(3, 33)]]
+        s0 = [2, 0, 3, 1, 4, 0, 1, 5, 2, 0, 3, 8, 0, 4, 1, 0, 1, 2]
+        sm = [[(i * 7 + j * 3) % 6 for j in range(18)] for i in range(18)]
+        raw = make_raw(18, d, v, w, s0, sm, ids)
+        res = plan(raw)
+        steps = res["canonical_plan"]["steps"]
+        prev_end = 0
+        seen = set()
+        for pos, step in enumerate(steps):
+            tid = step["id"]
+            k = ids.index(tid)
+            self.assertNotIn(tid, seen)
+            seen.add(tid)
+            ready = s0[k] if pos == 0 else prev_end + sm[ids.index(steps[pos - 1]["id"])][k]
+            self.assertEqual(step["slew"]["finish_time"], ready)
+            self.assertGreaterEqual(step["start_time"], ready)
+            self.assertEqual(step["end_time"],
+                             step["start_time"] + step["exposure_seconds"])
+            self.assertEqual(step["exposure_seconds"], d[k])
+            self.assertGreaterEqual(step["start_time"], step["window"]["open"])
+            self.assertLessEqual(step["end_time"], step["window"]["close"])
+            prev_end = step["end_time"]
+        self.assertEqual(res["objective"]["final_end_time"], prev_end)
+        self.assertEqual(len(res["canonical_plan"]["target_ids"]), len(steps))
+
     def test_step_evidence_fields(self):
         raw = make_raw(
             n=2,

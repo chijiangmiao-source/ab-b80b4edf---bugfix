@@ -71,6 +71,35 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(body["canonical_plan"]["target_ids"], [1, 2])
         self.assertEqual(len(body["classifications"]), 2)
 
+    def test_plan_replay_four_target_lex_tie(self):
+        # Regression replay over HTTP: the canonical sequence must be the
+        # lexicographically smallest of the value-4 / end-8 optima.
+        raw = {
+            "targets": [
+                {"id": 1, "duration": 1, "value": 1,
+                 "windows": [{"open": 5, "close": 12}]},
+                {"id": 2, "duration": 1, "value": 1,
+                 "windows": [{"open": 7, "close": 9}]},
+                {"id": 3, "duration": 1, "value": 1,
+                 "windows": [{"open": 2, "close": 7}]},
+                {"id": 4, "duration": 1, "value": 1,
+                 "windows": [{"open": 0, "close": 8}]},
+            ],
+            "slew": {
+                "from_night_start": [3, 0, 1, 1],
+                "between_targets": [[0, 0, 6, 6], [3, 2, 0, 2],
+                                   [1, 4, 6, 2], [0, 6, 0, 3]],
+            },
+        }
+        status, body = self._post(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["canonical_plan"]["target_ids"], [3, 4, 1, 2])
+        intervals = [(s["start_time"], s["end_time"])
+                     for s in body["canonical_plan"]["steps"]]
+        self.assertEqual(intervals, [(2, 3), (5, 6), (6, 7), (7, 8)])
+        self.assertEqual(body["objective"],
+                         {"total_value": 4, "final_end_time": 8})
+
     def test_plan_invalid_json(self):
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/plan",

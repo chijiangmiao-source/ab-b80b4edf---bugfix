@@ -26,9 +26,10 @@ target's membership across all plans tied on criteria 1+2:
 ``required`` / ``optional`` / ``excluded``.
 
 Algorithm: subset DP over ``(mask, last)`` storing the earliest achievable
-end time; a reverse reachability closure over optimal masks collects every
-state lying on an optimal plan; the canonical sequence is recovered by
-greedy smallest-id extension inside that closure.  Pure standard library.
+end time *and* a parent pointer to the lexicographically smallest id sequence
+attaining it; the canonical sequence is the smallest sequence among the
+optimal masks, recovered by following the parent pointers.  Pure standard
+library.
 """
 
 from __future__ import annotations
@@ -305,63 +306,27 @@ def plan(raw_request: dict) -> dict:
         elif v == best_value and e == best_end:
             optimal_masks.add(mask)
 
-    # Reverse closure: good[mask,last] lies on at least one ordering that
-    # starts at a seed, realizes the dp earliest times, and ends (at an
-    # optimal mask) at best_end.
-    good = bytearray(size * m)
-    stack = []
-    for om in optimal_masks:
-        if om == 0:
-            continue
-        base = om * m
-        x = om
-        while x:
-            b = x & -x
-            x ^= b
-            last = lsb_index[b]
-            if dp[base + last] == best_end:
-                p = base + last
-                if not good[p]:
-                    good[p] = 1
-                    stack.append((om, last))
-
-    while stack:
-        mask, last = stack.pop()
-        prev_mask = mask ^ (1 << last)
-        if prev_mask == 0:
-            continue
-        cur_end = dp[mask * m + last]
-        base = prev_mask * m
-        x = prev_mask
-        while x:
-            b = x & -x
-            x ^= b
-            prev = lsb_index[b]
-            prev_end = dp[base + prev]
-            if prev_end == UNREACH:
-                continue
-            ready = prev_end + sm[prev][last]
-            st = -1
-            for lo, hi in wins[last]:
-                t = ready if ready > lo else lo
-                if t + dur[last] <= hi and (st < 0 or t < st):
-                    st = t
-            if st >= 0 and st + dur[last] == cur_end:
-                p = base + prev
-                if not good[p]:
-                    good[p] = 1
-                    stack.append((prev_mask, prev))
-
     # Membership of every target across all criteria-1+2 optimal plans.
+    # (Set membership only: a mask is tied iff its *earliest* achievable end
+    # equals best_end -- any later schedule of that set cannot finish earlier,
+    # and ending exactly at best_end is what the backward DP below admits.)
     ever_in = 0
     ever_out = 0
     for om in optimal_masks:
         ever_in |= om
         ever_out |= full ^ om
 
-    canonical_steps, canonical_ids = _canonical(
-        m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks
-    )
+    if optimal_masks == {0}:
+        # Empty optimum: nothing observable contributes; skip reconstruction
+        # machinery entirely.
+        canonical_steps, canonical_ids = [], []
+    else:
+        latest = _backward_deadlines(
+            m, full, size, lsb_index, dp, dur, wins, sm, optimal_masks, best_end
+        )
+        canonical_steps, canonical_ids = _canonical(
+            m, ids, alive, dur, wins, s0, sm, latest, optimal_masks, best_end
+        )
 
     classifications = []
     for idx in range(n):
@@ -397,12 +362,108 @@ def plan(raw_request: dict) -> dict:
     }
 
 
-def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
+def _latest_start(windows, duration: int, cap: int):
+    """Latest integer exposure start ``s <= cap`` fully inside a window.
+
+    Returns None when no start at or before ``cap`` is feasible (which also
+    covers every negative cap).
+    """
+    best = None
+    for lo, hi in windows:
+        upper = hi - duration
+        if upper > cap:
+            upper = cap
+        if upper >= lo and (best is None or upper > best):
+            best = upper
+    return best
+
+
+def _backward_deadlines(
+    m, full, size, lsb_index, dp, dur, wins, sm, optimal_masks, best_end
+):
+    """latest[S, i] = latest permitted exposure *end* at state (S ends in i)
+    from which some criteria-1+2 optimal target set is still completable,
+    with every later exposure ending by ``best_end``.
+
+    A state whose set is itself optimal may simply terminate; otherwise the
+    exposure of an appended target j starts no later than the latest legal
+    start allowed by the successor's deadline, so the end at i must satisfy
+    ``end_i + slew[i][j] <= start_j``.  UNREACH marks dead states.
+
+    Descending mask order is topological: every successor adds a bit and is
+    therefore a numerically larger mask.
+    """
+    # extendable[mask]: mask is a subset of some optimal target set, i.e. a
+    # completion to an optimal plan is not a priori impossible.
+    extendable = bytearray(size)
+    for om in optimal_masks:
+        extendable[om] = 1
+    for mask in range(full - 1, -1, -1):
+        if extendable[mask]:
+            continue
+        missing = full ^ mask
+        while missing:
+            b = missing & -missing
+            missing ^= b
+            if extendable[mask | b]:
+                extendable[mask] = 1
+                break
+
+    optimal = optimal_masks  # local alias for the hot membership test
+    latest = [UNREACH] * (size * m)
+    for mask in range(full, 0, -1):
+        if not extendable[mask]:
+            continue
+        remaining = full ^ mask
+        base = mask * m
+        members = mask
+        while members:
+            b = members & -members
+            members ^= b
+            last = lsb_index[b]
+            # Unreachable forward states can lie on no feasible plan.
+            dp_end = dp[base + last]
+            if dp_end == UNREACH:
+                continue
+            # Terminate here when this set is optimal: ending by best_end is
+            # then sufficient (this per-last state can reach that end).
+            if mask in optimal and dp_end <= best_end:
+                deadline = best_end
+            else:
+                deadline = UNREACH
+            row = sm[last]
+            cand = remaining
+            while cand:
+                cb = cand & -cand
+                cand ^= cb
+                nxt = lsb_index[cb]
+                nmask = mask | cb
+                succ_deadline = latest[nmask * m + nxt]
+                if succ_deadline == UNREACH:
+                    continue
+                # The successor's deadline bounds the *end* of nxt's
+                # exposure, hence the cap on its start is deadline - dur.
+                start = _latest_start(
+                    wins[nxt], dur[nxt], succ_deadline - dur[nxt]
+                )
+                if start is None:
+                    continue
+                bound = start - row[nxt]
+                if bound > deadline:
+                    deadline = bound
+            if deadline != UNREACH:
+                latest[base + last] = deadline
+    return latest
+
+
+def _canonical(m, ids, alive, dur, wins, s0, sm, latest, optimal_masks, best_end):
     """Greedy reconstruction of the lexicographically smallest optimal plan.
 
-    At each position take the smallest id whose next state is in the reverse
-    closure; the earliest-start timeline is then forced (dp times), so each
-    sequence has exactly one reported schedule.
+    At each position take the smallest id whose earliest feasible start
+    still meets the backward deadline; that deadline is exact (later
+    feasibility is monotone in the previous end), so the walk cannot enter a
+    state from which no optimal set is completable.  The earliest-start
+    timeline is then forced, so each sequence has exactly one schedule.
     """
     # Compressed indices ordered by user-facing target id.
     order = sorted(range(m), key=lambda k: ids[alive[k]])
@@ -424,29 +485,27 @@ def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
     steps = []
     out_ids = []
 
-    while True:
+    while mask not in optimal_masks:
         chosen = -1
         for k in order:
             bit = 1 << k
             if mask & bit:
                 continue
-            new_mask = mask | bit
-            end = dp[new_mask * m + k]
-            if end == UNREACH or not good[new_mask * m + k]:
-                continue
             ready = s0[k] if last == -1 else prev_end + sm[last][k]
             st, _ = earliest_with_window(k, ready)
-            if st is None or st + dur[k] != end:
+            if st is None:
                 continue
-            chosen = k
-            chosen_ready = ready
-            chosen_start = st
-            chosen_end = end
-            break
+            end = st + dur[k]
+            if end <= latest[(mask | bit) * m + k]:
+                chosen = k
+                chosen_ready = ready
+                chosen_start = st
+                chosen_end = end
+                break
         if chosen == -1:
-            break
+            # Defensive: should be impossible by construction of deadlines.
+            raise RuntimeError("internal: no canonical extension exists")
 
-        mask |= 1 << chosen
         _, win = earliest_with_window(chosen, chosen_ready)
         step = {
             "order": len(steps) + 1,
@@ -463,11 +522,12 @@ def _canonical(m, ids, alive, dur, wins, s0, sm, dp, good, optimal_masks):
         }
         steps.append(step)
         out_ids.append(ids[alive[chosen]])
+        mask |= 1 << chosen
         last = chosen
         prev_end = chosen_end
 
-    if optimal_masks and mask not in optimal_masks:
-        # Defensive: should be impossible by construction of the closure.
+    if prev_end != best_end:
+        # Defensive: should be impossible by construction of the deadlines.
         raise RuntimeError("internal: reconstructed plan is not optimal")
 
     return steps, out_ids
